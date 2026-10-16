@@ -19,9 +19,13 @@ on:
         type: string
         default: gpt-6.1-sol
       llm_url:
-        description: OpenAI-compatible chat completions endpoint.
+        description: LLM endpoint. Must match `protocol`.
         type: string
-        default: https://api.openai.com/v1/chat/completions
+        default: https://api.openai.com/v1/responses
+      protocol:
+        description: "LLM wire protocol: openai-responses | openai | anthropic. gpt-6.1-sol rejects chat completions (max_tokens)."
+        type: string
+        default: openai-responses
       effort:
         description: "Review effort: low | medium | high (empty = OCR default)."
         type: string
@@ -87,6 +91,7 @@ jobs:
           llm_auth_token: ${{ secrets.CI_OPEN_AI_KEY }}
           llm_model: ${{ inputs.model }}
           llm_use_anthropic: "false"
+          llm_protocol: ${{ inputs.protocol }}
           # The default body sends {"thinking": ...}, which OpenAI rejects as an unknown field.
           llm_extra_body: "{}"
           github_token: ${{ steps.app-token.outputs.token || github.token }}
