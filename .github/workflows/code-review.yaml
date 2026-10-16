@@ -1,0 +1,112 @@
+name: Code Review (reusable)
+
+# Reusable workflow: AI review of a pull request with Open Code Review (OCR).
+# Secrets are NOT read from this repo; the calling repo must provide them.
+
+on:
+  workflow_call:
+    inputs:
+      exclude:
+        description: Comma-separated gitignore-style globs OCR must not review.
+        type: string
+        default: ""
+      fail_on_severity:
+        description: "Fail the job when a finding is at or above this level: none | critical | high | medium | low."
+        type: string
+        default: none
+      model:
+        description: LLM model ID sent to the OpenAI endpoint.
+        type: string
+        default: gpt-6.1-sol
+      llm_url:
+        description: OpenAI-compatible chat completions endpoint.
+        type: string
+        default: https://api.openai.com/v1/chat/completions
+      effort:
+        description: "Review effort: low | medium | high (empty = OCR default)."
+        type: string
+        default: ""
+    secrets:
+      CI_OPEN_AI_KEY:
+        description: OpenAI API key.
+        required: true
+      GHCI_APP_ID:
+        description: GitHub App ID. Comments post as the app; falls back to github-actions[bot] when unset.
+        required: false
+      GHCI_APP_PRIVATE_KEY:
+        description: GitHub App private key (full .pem contents).
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # `secrets` cannot be used directly in step `if:`; expose presence as a flag.
+      HAS_APP: ${{ secrets.GHCI_APP_ID != '' && secrets.GHCI_APP_PRIVATE_KEY != '' }}
+      FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
+      EXCLUDE: ${{ inputs.exclude }}
+    steps:
+      - name: Validate inputs
+        run: |
+          case "$FAIL_ON_SEVERITY" in
+            none|critical|high|medium|low) ;;
+            *) echo "::error::fail_on_severity must be one of: none, critical, high, medium, low (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+          esac
+
+      - name: Write exclude rules
+        id: rules
+        run: |
+          rule=""
+          if [ -n "$EXCLUDE" ]; then
+            rule="$RUNNER_TEMP/ocr-rule.json"
+            jq -n --arg e "$EXCLUDE" \
+              '{exclude: ($e | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))}' > "$rule"
+            cat "$rule"
+          fi
+          echo "path=$rule" >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App token
+        id: app-token
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.GHCI_APP_ID }}
+          private-key: ${{ secrets.GHCI_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - name: Open Code Review
+        uses: alibaba/open-code-review@1672852136fc87748249d22bce0819f33419ea79 # v1.13.0
+        with:
+          llm_url: ${{ inputs.llm_url }}
+          llm_auth_token: ${{ secrets.CI_OPEN_AI_KEY }}
+          llm_model: ${{ inputs.model }}
+          llm_use_anthropic: "false"
+          # The default body sends {"thinking": ...}, which OpenAI rejects as an unknown field.
+          llm_extra_body: "{}"
+          github_token: ${{ steps.app-token.outputs.token || github.token }}
+          ocr_version: 1.13.0
+          effort: ${{ inputs.effort }}
+          rule: ${{ steps.rules.outputs.path }}
+          # Update one summary comment and skip findings already posted, so
+          # every push to the PR does not add duplicate comments.
+          sticky_summary: "true"
+          incremental: "true"
+
+      - name: Enforce fail_on_severity
+        if: env.FAIL_ON_SEVERITY != 'none'
+        run: |
+          count=$(jq --arg t "$FAIL_ON_SEVERITY" '
+            {critical: 4, high: 3, medium: 2, low: 1} as $rank
+            | [.comments[]? | select(($rank[.severity // ""] // 0) >= $rank[$t])] | length
+          ' /tmp/ocr-result.json)
+          echo "Findings at or above '$FAIL_ON_SEVERITY': $count"
+          if [ "$count" -gt 0 ]; then
+            echo "::error::$count finding(s) at or above severity '$FAIL_ON_SEVERITY'"
+            exit 1
+          fi
