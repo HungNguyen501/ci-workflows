@@ -1,8 +1,4 @@
 name: Code Review (reusable)
-
-# Reusable workflow: AI review of a pull request with Open Code Review (OCR).
-# Secrets are NOT read from this repo; the calling repo must provide them.
-
 on:
   workflow_call:
     inputs:
@@ -11,11 +7,10 @@ on:
         type: string
         default: ""
       fail_on_severity:
-        description: "Fail the job when a finding is at or above this level: none | critical | high | medium | low."
+        description: "Fail the check on a finding at or above this level: none | critical | high | medium | low."
         type: string
         default: none
       model:
-        description: LLM model ID sent to the OpenAI endpoint.
         type: string
         default: gpt-6.1-sol
       llm_url:
@@ -23,95 +18,111 @@ on:
         type: string
         default: https://api.openai.com/v1/responses
       protocol:
-        description: "LLM wire protocol: openai-responses | openai | anthropic. gpt-6.1-sol rejects chat completions (max_tokens)."
+        description: "openai-responses | openai. gpt-6.1-sol rejects chat completions (max_tokens)."
         type: string
         default: openai-responses
       effort:
-        description: "Review effort: low | medium | high (empty = OCR default)."
+        description: "OCR review effort: low | medium | high (empty = OCR default)."
         type: string
         default: ""
     secrets:
       CI_OPEN_AI_KEY:
-        description: OpenAI API key.
         required: true
       GHCI_APP_ID:
-        description: GitHub App ID. Comments post as the app; falls back to github-actions[bot] when unset.
-        required: false
+        required: true
       GHCI_APP_PRIVATE_KEY:
-        description: GitHub App private key (full .pem contents).
-        required: false
-
-permissions:
-  contents: read
-  pull-requests: write
+        required: true
 
 jobs:
-  code-review:
+  review:
+    # Fork PRs get no secrets, so skip them.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     env:
-      # `secrets` cannot be used directly in step `if:`; expose presence as a flag.
-      HAS_APP: ${{ secrets.GHCI_APP_ID != '' && secrets.GHCI_APP_PRIVATE_KEY != '' }}
-      FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
-      EXCLUDE: ${{ inputs.exclude }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      WORK: /tmp/review
+      OCR_NO_UPDATE: "1"
     steps:
-      - name: Validate inputs
-        run: |
-          case "$FAIL_ON_SEVERITY" in
-            none|critical|high|medium|low) ;;
-            *) echo "::error::fail_on_severity must be one of: none, critical, high, medium, low (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
-          esac
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Write exclude rules
-        id: rules
+      # Skill + posting script come from ci-workflows at the pinned commit (public repo).
+      - name: Fetch skill and post script
+        env:
+          RAW: https://raw.githubusercontent.com/${{ job.workflow_repository }}/${{ job.workflow_sha }}
         run: |
-          rule=""
-          if [ -n "$EXCLUDE" ]; then
-            rule="$RUNNER_TEMP/ocr-rule.json"
-            jq -n --arg e "$EXCLUDE" \
-              '{exclude: ($e | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))}' > "$rule"
-            cat "$rule"
-          fi
-          echo "path=$rule" >> "$GITHUB_OUTPUT"
+          mkdir -p "$WORK"
+          curl -fsSL "$RAW/skills/code-review/SKILL.md" -o "$WORK/SKILL.md"
+          curl -fsSL "$RAW/scripts/post-review.js" -o "$WORK/post-review.js"
+
+      - name: Install OCR
+        run: npm install -g --no-fund --no-audit "@alibaba-group/open-code-review@1.13.0"
+
+      # Skill -> one OCR rule for every file, merged on top of OCR's built-in per-language rules.
+      - name: Build rules
+        env:
+          EXCLUDE: ${{ inputs.exclude }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Drop the front matter, add the severity mapping.
+          awk 'NR==1 && /^---/ {fm=1; next} fm && /^---/ {fm=0; next} !fm' "$WORK/SKILL.md" > "$WORK/rule.txt"
+          printf '\n## Severity levels\n\nUse: critical, high (= major), medium, low (= minor). Give a concrete fix for every issue.\n' >> "$WORK/rule.txt"
+
+          jq -n --rawfile rule "$WORK/rule.txt" --arg e "$EXCLUDE" '{
+            exclude: ($e | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
+            rules: [{path: "**/*", rule: $rule, merge_system_rule: true}]
+          }' > "$WORK/rule.json"
+
+          printf '# %s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$WORK/background.md"
+
+      # The OpenAI key is only in this step's environment.
+      - name: Run OCR
+        env:
+          OCR_LLM_TOKEN: ${{ secrets.CI_OPEN_AI_KEY }}
+          LLM_URL: ${{ inputs.llm_url }}
+          LLM_MODEL: ${{ inputs.model }}
+          PROTOCOL: ${{ inputs.protocol }}
+          EFFORT: ${{ inputs.effort }}
+        run: |
+          ocr config set llm.url "$LLM_URL"
+          ocr config set llm.model "$LLM_MODEL"
+          ocr config set llm.protocol "$PROTOCOL"
+          ocr config set llm.auth_token_cmd 'printf "%s" "$OCR_LLM_TOKEN"'
+
+          args=(--from "$BASE_SHA" --to "$HEAD_SHA" --audience agent --format json
+                --rule "$WORK/rule.json" --background-file "$WORK/background.md")
+          [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
+
+          code=0
+          ocr review "${args[@]}" > "$WORK/result.json" 2> "$WORK/stderr.log" || code=$?
+
+          echo "::group::OCR result";  cat "$WORK/result.json";  echo "::endgroup::"
+          echo "::group::OCR stderr";  cat "$WORK/stderr.log";   echo "::endgroup::"
+          exit "$code"
 
       - name: Mint GitHub App token
         id: app-token
-        if: env.HAS_APP == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.GHCI_APP_ID }}
           private-key: ${{ secrets.GHCI_APP_PRIVATE_KEY }}
-          permission-contents: read
           permission-pull-requests: write
 
-      - name: Open Code Review
-        uses: alibaba/open-code-review@1672852136fc87748249d22bce0819f33419ea79 # v1.13.0
+      - name: Post review
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RESULT_FILE: ${{ env.WORK }}/result.json
+          FAIL_ON: ${{ inputs.fail_on_severity }}
         with:
-          llm_url: ${{ inputs.llm_url }}
-          llm_auth_token: ${{ secrets.CI_OPEN_AI_KEY }}
-          llm_model: ${{ inputs.model }}
-          llm_use_anthropic: "false"
-          llm_protocol: ${{ inputs.protocol }}
-          # The default body sends {"thinking": ...}, which OpenAI rejects as an unknown field.
-          llm_extra_body: "{}"
-          github_token: ${{ steps.app-token.outputs.token || github.token }}
-          ocr_version: 1.13.0
-          effort: ${{ inputs.effort }}
-          rule: ${{ steps.rules.outputs.path }}
-          # Update one summary comment and skip findings already posted, so
-          # every push to the PR does not add duplicate comments.
-          sticky_summary: "true"
-          incremental: "true"
-
-      - name: Enforce fail_on_severity
-        if: env.FAIL_ON_SEVERITY != 'none'
-        run: |
-          count=$(jq --arg t "$FAIL_ON_SEVERITY" '
-            {critical: 4, high: 3, medium: 2, low: 1} as $rank
-            | [.comments[]? | select(($rank[.severity // ""] // 0) >= $rank[$t])] | length
-          ' /tmp/ocr-result.json)
-          echo "Findings at or above '$FAIL_ON_SEVERITY': $count"
-          if [ "$count" -gt 0 ]; then
-            echo "::error::$count finding(s) at or above severity '$FAIL_ON_SEVERITY'"
-            exit 1
-          fi
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await require(process.env.WORK + '/post-review.js')({ github, context, core });
